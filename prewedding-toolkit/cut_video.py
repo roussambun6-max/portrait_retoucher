@@ -2,7 +2,26 @@
 """Cut prewedding videos (offline). ffmpeg is bundled through imageio-ffmpeg,
 so nothing else has to be installed on the computer.
 
+The cut standard is ON by default (see cut_standard.py). With no times given:
+  * the first 0.5 s of every clip is dropped,
+  * the cut starts when the motion / action starts,
+  * the cut ends before camera shake or a pan-out,
+  * shaky and behind-the-scenes (BTS) clips are skipped.
+Give --start/--end/--segments to choose the cut yourself (used exactly).
+
 Usage examples:
+  # automatic: cut one clip by the standard -> pw01_cut.mp4
+  python cut_video.py "D:\\Videos\\pw01.mp4"
+
+  # automatic: every clip in a folder -> D:\\Shoot\\_cut\\*_cut.mp4 + cut_report.txt
+  python cut_video.py "D:\\Shoot"
+
+  # a folder straight to one Premiere Pro timeline, no video render
+  python cut_video.py "D:\\Shoot" --xml-only
+
+  # only show what the standard would cut
+  python cut_video.py "D:\\Shoot" --dry-run
+
   # one part, 0:30 -> 2:15
   python cut_video.py "D:\\Videos\\pw01.mp4" --start 0:30 --end 2:15
 
@@ -35,6 +54,8 @@ try:
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:  # fall back to ffmpeg on PATH
     FFMPEG = "ffmpeg"
+
+SKIPPED = 3   # exit code when the standard skips the clip (shaky / BTS)
 
 
 def parse_time(t: str) -> float:
@@ -108,10 +129,103 @@ def write_premiere_xml(args, src: Path, dst: Path, segs, has_audio: bool) -> int
     return 0
 
 
+def standard_from_args(args):
+    import cut_standard
+
+    return cut_standard.Standard(head_trim=args.head_trim, shake_limit=args.shake,
+                                 pan_limit=args.pan, min_keep=args.min_length,
+                                 skip_bad=not args.no_skip)
+
+
+def write_folder_timeline(args, picks, xml_path: Path) -> int:
+    """One Premiere Pro timeline with the kept part of every clip, in name order."""
+    from dataclasses import replace
+
+    import premiere_xml
+
+    cuts = []
+    try:
+        for p in picks:
+            if p.kept:
+                media = premiere_xml.probe_media(p.path, FFMPEG)
+                if args.mute:
+                    media = replace(media, audio_channels=0)
+                cuts.append(premiere_xml.Cut(media, p.start, p.end))
+        if not cuts:
+            print("No clip was kept, so no Premiere XML was written.")
+            return 0
+        placements = premiere_xml.write_xmeml(xml_path, cuts, args.xml_fps)
+    except ValueError as e:
+        print(f"[ERROR] Premiere XML: {e}")
+        return 1
+    print("\nPremiere XML:")
+    print(premiere_xml.describe(placements, args.xml_fps))
+    print(f"Saved to: {xml_path}  (Premiere Pro: File > Import)")
+    return 0
+
+
+def cut_folder(folder: Path, args) -> int:
+    """Apply the cut standard to every clip in a folder."""
+    import cut_standard
+
+    if args.start or args.end or args.segments or args.no_auto:
+        print("[ERROR] a folder is always cut by the standard; "
+              "--start/--end/--segments/--no-auto work with one video only")
+        return 1
+    clips = cut_standard.list_clips(folder)
+    if not clips:
+        print(f"[ERROR] no videos found in: {folder}")
+        return 1
+    out_dir = Path(args.output) if args.output else folder / "_cut"
+    std = standard_from_args(args)
+    print(f"{len(clips)} clips in {folder}")
+    picks, failed = [], []
+    for i, clip in enumerate(clips, 1):
+        print(f"\n[{i}/{len(clips)}] {clip.name}: checking shake, pans and action ...")
+        try:
+            pick = cut_standard.pick_cut(clip, std, FFMPEG)
+        except Exception as e:  # unreadable file: note it and go on with the others
+            print(f"[ERROR] {clip.name}: {e}")
+            failed.append(f"FAIL  {clip.name}: {e}")
+            continue
+        print(pick.summary())
+        picks.append(pick)
+        if not pick.kept or args.dry_run or args.xml_only:
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if cut_one(args, clip, out_dir / f"{clip.stem}_cut.mp4", pick=pick, xml=False) != 0:
+            failed.append(f"FAIL  {clip.name}: ffmpeg could not cut it")
+
+    kept = [p for p in picks if p.kept]
+    total = f"{len(kept)} kept, {len(picks) - len(kept)} skipped" + \
+        (f", {len(failed)} failed" if failed else "")
+    print(f"\n{total}")
+    if args.dry_run:
+        return 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = out_dir / "cut_report.txt"
+    lines = ["Pre-wedding cut standard",
+             f"Folder: {folder}",
+             f"Rules: drop the first {std.head_trim:g}s, start when the action starts, "
+             "end before camera shake or a pan-out, skip shaky and behind-the-scenes clips.",
+             "", *[p.summary() for p in picks], *failed, "", total, ""]
+    report.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Report: {report}")
+    code = 1 if failed else 0
+    if args.xml or args.xml_only:
+        if write_folder_timeline(args, picks, out_dir / f"{folder.name}_timeline.xml") != 0:
+            code = 1
+    if not args.xml_only and kept:
+        print(f"Cut videos saved in: {out_dir}")
+    return code
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cut prewedding videos")
-    ap.add_argument("input", help="video file")
-    ap.add_argument("-o", "--output", help="output file (default: <name>_cut.mp4)")
+    ap.add_argument("input", help="video file, or a folder of clips")
+    ap.add_argument("-o", "--output",
+                    help="output file (default: <name>_cut.mp4); for a folder: output folder "
+                         "(default: <folder>\\_cut)")
     ap.add_argument("--start", help="start time, e.g. 0:30")
     ap.add_argument("--end", help="end time, e.g. 2:15")
     ap.add_argument("--segments", help='several parts to join, e.g. "0:30-0:45, 1:10-1:25"')
@@ -127,22 +241,64 @@ def main() -> int:
                     help="write only the Premiere Pro XML, do not render the video")
     ap.add_argument("--xml-fps", default="25",
                     help="Premiere sequence frame rate for --xml: 25, 29.97, 50, 59.94 ... (default 25)")
+    std = ap.add_argument_group(
+        "cut standard", "used when no --start/--end/--segments are given, and for folders")
+    std.add_argument("--no-auto", action="store_true",
+                     help="turn the standard off: cut the whole clip or the times you give")
+    std.add_argument("--no-skip", action="store_true",
+                     help="never skip shaky or behind-the-scenes clips")
+    std.add_argument("--head-trim", type=float, default=0.5,
+                     help="seconds dropped at the start of every clip (default 0.5)")
+    std.add_argument("--shake", type=float, default=0.15,
+                     help="shake limit; higher allows more shake (default 0.15)")
+    std.add_argument("--pan", type=float, default=0.35,
+                     help="pan-out speed limit in picture widths per second (default 0.35)")
+    std.add_argument("--min-length", type=float, default=1.5,
+                     help="shortest cut to keep, in seconds (default 1.5)")
+    std.add_argument("--dry-run", action="store_true",
+                     help="only show what would be cut; make no files")
     args = ap.parse_args()
 
-    src = Path(args.input.strip('"'))
+    src = Path(args.input.strip().strip('"'))
+    if src.is_dir():
+        return cut_folder(src, args)
     if not src.is_file():
         print(f"[ERROR] not found: {src}")
         return 1
     dst = Path(args.output) if args.output else src.with_name(src.stem + "_cut.mp4")
+    return cut_one(args, src, dst)
+
+
+def cut_one(args, src: Path, dst: Path, pick=None, xml: bool = True) -> int:
+    """Cut one clip. `pick` is the standard's decision when it is already known."""
     duration, has_audio = probe(src)
     has_audio = has_audio and not args.mute
-    try:
-        segs = build_segments(args, duration)
-    except ValueError as e:
-        print(f"[ERROR] {e}")
-        return 1
+    if not (args.start or args.end or args.segments or args.no_auto):
+        if pick is None:
+            import cut_standard
 
-    if args.xml or args.xml_only:
+            print(f"{src.name}: checking shake, pans and action ...")
+            try:
+                pick = cut_standard.pick_cut(src, standard_from_args(args), FFMPEG)
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                return 1
+            print(pick.summary())
+        if not pick.kept:
+            print("Skipped by the cut standard (use --no-skip to cut it anyway).")
+            return SKIPPED
+        segs = [(pick.start, pick.end)]
+    else:
+        try:
+            segs = build_segments(args, duration)
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            return 1
+    if args.dry_run:
+        print("Would cut:", ", ".join(f"{a:g}s-{b:g}s" for a, b in segs))
+        return 0
+
+    if xml and (args.xml or args.xml_only):
         if write_premiere_xml(args, src, dst, segs, has_audio) != 0:
             return 1
         if args.xml_only:
