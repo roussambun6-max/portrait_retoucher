@@ -14,6 +14,12 @@ Usage examples:
 
   # very fast cut without re-encoding (cut points snap to keyframes)
   python cut_video.py pw01.mp4 --start 0:30 --end 2:15 --fast
+
+  # also write pw01_cut.xml to open the cuts in Premiere Pro (25 fps sequence)
+  python cut_video.py pw01.mp4 --segments "0:30-0:45, 1:10-1:25" --xml
+
+  # only the Premiere XML, no video render; 29.97 fps sequence
+  python cut_video.py pw01.mp4 --segments "0:30-0:45, 1:10-1:25" --xml-only --xml-fps 29.97
 """
 from __future__ import annotations
 
@@ -83,6 +89,25 @@ def video_filter(args) -> str:
     return ",".join(f)
 
 
+def write_premiere_xml(args, src: Path, dst: Path, segs, has_audio: bool) -> int:
+    """Premiere Pro timeline of the cuts, pointing at the ORIGINAL video."""
+    import premiere_xml
+
+    xml_path = dst.with_suffix(".xml")
+    try:
+        placements = premiere_xml.export_cut_list(
+            src, segs, xml_path, sequence_fps=args.xml_fps, ffmpeg=FFMPEG, audio=has_audio)
+    except ValueError as e:
+        print(f"[ERROR] Premiere XML: {e}")
+        return 1
+    print("Premiere XML:")
+    print(premiere_xml.describe(placements, args.xml_fps))
+    if args.ratio or args.height or args.fade:
+        print("  (--ratio/--height/--fade are not in the XML; set them in Premiere)")
+    print(f"Saved to: {xml_path}  (Premiere Pro: File > Import)\n")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Cut prewedding videos")
     ap.add_argument("input", help="video file")
@@ -96,6 +121,12 @@ def main() -> int:
     ap.add_argument("--mute", action="store_true", help="remove the audio")
     ap.add_argument("--crf", type=int, default=18, help="quality 15 (best) - 28 (small); default 18")
     ap.add_argument("--fast", action="store_true", help="no re-encode (one part only, keyframe accurate)")
+    ap.add_argument("--xml", action="store_true",
+                    help="also write a Premiere Pro XML timeline of the cuts (<output name>.xml)")
+    ap.add_argument("--xml-only", action="store_true",
+                    help="write only the Premiere Pro XML, do not render the video")
+    ap.add_argument("--xml-fps", default="25",
+                    help="Premiere sequence frame rate for --xml: 25, 29.97, 50, 59.94 ... (default 25)")
     args = ap.parse_args()
 
     src = Path(args.input.strip('"'))
@@ -110,6 +141,12 @@ def main() -> int:
     except ValueError as e:
         print(f"[ERROR] {e}")
         return 1
+
+    if args.xml or args.xml_only:
+        if write_premiere_xml(args, src, dst, segs, has_audio) != 0:
+            return 1
+        if args.xml_only:
+            return 0
 
     if args.fast:
         if len(segs) > 1 or args.ratio or args.height or args.fade:
